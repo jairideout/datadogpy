@@ -36,7 +36,6 @@ ENTITY_ID_TAG_NAME = "dd.internal.entity_id"
 # Default buffer settings
 UDP_OPTIMAL_PAYLOAD_LENGTH = 1432
 UDS_OPTIMAL_PAYLOAD_LENGTH = 8192
-MAX_BUFFER_ITEM = sys.maxsize
 
 # Mapping of each "DD_" prefixed environment variable to a specific tag name
 DD_ENV_TAGS_MAPPING = {
@@ -53,10 +52,11 @@ DEFAULT_TELEMETRY_MIN_FLUSH_INTERVAL = 10
 class DogStatsd(object):
     OK, WARNING, CRITICAL, UNKNOWN = (0, 1, 2, 3)
 
-    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, max_buffer_size=MAX_BUFFER_ITEM, max_buffer_bytes_size=0,
-                 namespace=None, constant_tags=None, use_ms=False, use_default_route=False,
+    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, namespace=None, 
+                 constant_tags=None, use_ms=False, use_default_route=False,
                  socket_path=None, default_sample_rate=1, disable_telemetry=False,
-                 telemetry_min_flush_interval=DEFAULT_TELEMETRY_MIN_FLUSH_INTERVAL):
+                 telemetry_min_flush_interval=DEFAULT_TELEMETRY_MIN_FLUSH_INTERVAL,
+                 max_buffer_len=0,):
         """
         Initialize a DogStatsd object.
 
@@ -94,14 +94,10 @@ class DogStatsd(object):
         :param port: the port of the DogStatsd server.
         :type port: integer
 
-        :param max_buffer_size: Maximum number of metrics to buffer before sending to the server
-        if sending metrics in batch.
-        :type max_buffer_size: integer
-
-        :param max_buffer_bytes_size: Maximum number of bytes to buffer before sending to the server
+        :param max_buffer_len: Maximum number of bytes to buffer before sending to the server
         if sending metrics in batch. If not specified it will be adjusted to a optimal value
         depending on the connection type.
-        :type max_buffer_bytes_size: integer
+        :type max_buffer_len: integer
 
         :param namespace: Namespace to prefix all metric names
         :type namespace: string
@@ -140,7 +136,7 @@ class DogStatsd(object):
                 %s, using %s as port number", dogstatsd_port, port)
 
         # Connection
-        self._max_payload_size = max_buffer_bytes_size
+        self._max_payload_size = max_buffer_len
         if socket_path is not None:
             self.socket_path = socket_path
             self.host = None
@@ -158,7 +154,6 @@ class DogStatsd(object):
 
         # Socket
         self.socket = None
-        self._max_buffer_items = max_buffer_size
         self._send = self._send_to_server
         self.encoding = 'utf-8'
 
@@ -188,7 +183,7 @@ class DogStatsd(object):
                 "client_version:{}".format(client_version),
                 "client_transport:{}".format(transport),
                 ]
-        self._reset_telementry()
+        self._reset_telemetry()
         self._telemetry_flush_interval = telemetry_min_flush_interval
         self._telemetry = not disable_telemetry
 
@@ -199,7 +194,7 @@ class DogStatsd(object):
         self._telemetry = True
 
     def __enter__(self):
-        self.open_buffer(self._max_buffer_items)
+        self.open_buffer()
         return self
 
     def __exit__(self, type, value, traceback):
@@ -241,7 +236,7 @@ class DogStatsd(object):
 
         return self.socket
 
-    def open_buffer(self, max_buffer_size=MAX_BUFFER_ITEM):
+    def open_buffer(self):
         """
         Open a buffer to send a batch of metrics in one packet.
 
@@ -251,7 +246,6 @@ class DogStatsd(object):
         >>>     batch.gauge('users.online', 123)
         >>>     batch.gauge('active.connections', 1001)
         """
-        self._max_buffer_items = max_buffer_size
         self._current_buffer_total_size = 0
         self.buffer = []
         self._send = self._send_to_buffer
@@ -406,7 +400,7 @@ class DogStatsd(object):
         # Send it
         self._send(payload)
 
-    def _reset_telementry(self):
+    def _reset_telemetry(self):
         self.metrics_count = 0
         self.events_count = 0
         self.service_checks_count = 0
@@ -435,23 +429,17 @@ class DogStatsd(object):
         return False
 
     def _send_to_server(self, packet):
-        flush_telemetry = self._is_telemetry_flush_time()
-        if flush_telemetry:
+        self._xmit_packet(packet)
+        if self._is_telemetry_flush_time():
             telemetry = self._flush_telemetry()
-            same_packet = (len(telemetry) + len(packet) < self._max_payload_size)
-            if same_packet:
-                packet += "\n"+telemetry
+            self._reset_telemetry()
+            self._xmit_packet(telemetry)
+
+    def _xmit_packet(self, packet):
         try:
             # If set, use socket directly
             (self.socket or self.get_socket()).send(packet.encode(self.encoding))
             if self._telemetry:
-                if flush_telemetry:
-                    if not same_packet:
-                        (self.socket or self.get_socket()).send(telemetry.encode(self.encoding))
-                    self._reset_telementry()
-                    if not same_packet:
-                        self.packets_sent += 1
-                        self.bytes_sent += len(telemetry)
                 self.packets_sent += 1
                 self.bytes_sent += len(packet)
             return
@@ -469,10 +457,10 @@ class DogStatsd(object):
                 self.close_socket()
         except Exception as e:
             log.error("Unexpected error: %s", str(e))
-
         if self._telemetry:
             self.bytes_dropped += len(packet)
             self.packets_dropped += 1
+
 
     def _send_to_buffer(self, packet):
         if self._should_flush(len(packet)):
@@ -481,8 +469,6 @@ class DogStatsd(object):
         self._current_buffer_total_size += (len(packet) + 1)
 
     def _should_flush(self, length_to_be_added):
-        if len(self.buffer) >= self._max_buffer_items:
-            return True
         if self._current_buffer_total_size + length_to_be_added > self._max_payload_size:
             return True
         return False
